@@ -31,7 +31,7 @@ function endGame(roomId,winner){
     const memberSocket = playerToSocket.get(memberId);
     if(memberSocket && memberSocket.readyState === 1){
       memberSocket.send(JSON.stringify({
-        type : "Game Over!",
+        type : "game-over",
         data : {
           winner,
           remainingHiders : game.remainingHiders,
@@ -492,7 +492,7 @@ wss.on('connection', (socket) => {
       roomState.set(roomId,"playing");
       const hideTimer = setTimeout(() => {
         const currentGame = gameData.get(roomId);
-        if(!currentGame && currentGame !== "playing"){
+        if(!currentGame || currentGame !== "playing"){
           return;
         }
         currentGame.phase = "hunting";
@@ -647,6 +647,56 @@ wss.on('connection', (socket) => {
       if(gameState.remainingHiders === 0){
         endGame(roomId,"hunters");
       }
+      return;
+    }
+    if(payload.type === "room-state"){
+      const playerId = socketToPlayer.get(socket);
+      const roomId = playerToRoom.get(playerId);
+      if(!playerId || !roomId){
+        socket.send(JSON.stringify({
+          type : "error",
+          data : {
+            message : "Player or Room not Found!"
+          }
+        }));
+        return;
+      }
+      const roomMembers = rooms.get(roomId);
+      if(!roomMembers || roomMembers.size === 0){
+        socket.send(JSON.stringify({
+          type : "error",
+          data : {
+            message : "No room members found!"
+          }
+        }));
+        return;
+      }
+      const state = roomState.get(roomId);
+      if(state !== "lobby"){
+        socket.send(JSON.stringify({
+          type : "error",
+          data : {
+            message : "Room State not in lobby!"
+          }
+        }));
+        return;
+      }
+      const hostId = roomHosts.get(roomId);
+      const readyState = readyPlayers.get(roomId) ?? new Set();
+      const members = [...roomMembers].map((playerId) => ({
+        playerId : playerId,
+        ready : readyState.has(playerId)
+      }));
+      socket.send(JSON.stringify({
+        type : "room-state",
+        data : {
+          roomId : roomId,
+          hostId : hostId,
+          totalMembers : roomMembers.size,
+          state : state,
+          members : members
+        }
+      }));
       return;
     }
     // 7. Unknown Message Type //
