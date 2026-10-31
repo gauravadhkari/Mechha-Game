@@ -1,0 +1,1120 @@
+
+================================================================================
+FILE: client.js
+================================================================================
+
+import WebSocket from "ws";
+
+const socket = new WebSocket("ws://localhost:8080");
+socket.on('open', () => {
+    console.log("Connected to server");
+    socket.send("Hello from Node.js client!");
+});
+
+socket.on('message', (data) => {
+    
+    console.log("Message from server:", data.toString());
+});
+
+socket.on('error', (err) => {
+    console.error("WebSocket error:", err);
+});
+
+socket.on('close', () => {
+    console.log("Connection closed");
+});
+
+================================================================================
+FILE: package-lock.json
+================================================================================
+
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "backend",
+      "version": "1.0.0",
+      "license": "ISC",
+      "dependencies": {
+        "ws": "^8.22.0"
+      }
+    },
+    "node_modules/ws": {
+      "version": "8.22.0",
+      "resolved": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
+      "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=10.0.0"
+      },
+      "peerDependencies": {
+        "bufferutil": "^4.0.1",
+        "utf-8-validate": ">=5.0.2"
+      },
+      "peerDependenciesMeta": {
+        "bufferutil": {
+          "optional": true
+        },
+        "utf-8-validate": {
+          "optional": true
+        }
+      }
+    }
+  }
+}
+
+
+================================================================================
+FILE: package.json
+================================================================================
+
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}
+
+
+================================================================================
+FILE: src\server.js
+================================================================================
+
+import { WebSocketServer } from "ws";
+import { PORT } from "./config/constants.js";
+import { handleConnection } from "./websocket/connection.js";
+
+const wss = new WebSocketServer({ port: PORT });
+wss.on("connection", handleConnection);
+
+console.log(`Mecha Chameleon WebSocket server listening on port ${PORT}`);
+
+wss.on("listening", () => {
+  console.log(`WebSocket server ready at ws://localhost:${PORT}`);
+});
+
+wss.on("error", (error) => {
+  console.error("WebSocket server error:", error.message);
+});
+
+================================================================================
+FILE: src\config\constant.js
+================================================================================
+
+export const PORT = Number(process.env.PORT ?? 8080);
+export const HIDE_DURATION_MS = Number(process.env.HIDE_DURATION_MS ?? 60_000);
+export const HUNT_DURATION_MS = Number(process.env.HUNT_DURATION_MS ?? 60_000);
+export const MIN_PLAYERS = 2;
+
+================================================================================
+FILE: src\game\endGame.js
+================================================================================
+
+import {
+  gameData,
+  readyPlayers,
+  roomState,
+  rooms,
+  clearGameTimers,
+  resetPlayerState,
+} from "../state/store.js";
+import { sendToRoom } from "../utils/sendMessage.js";
+
+export function endGame(roomId, winner, reason = "round-finished") {
+  const game = gameData.get(roomId);
+  if (!game || game.status !== "playing") return false;
+
+  game.status = "finished";
+  game.phase = "ended";
+  game.winner = winner;
+  game.endedAt = Date.now();
+
+  clearGameTimers(roomId);
+
+  sendToRoom(roomId, "game-over", {
+    winner,
+    reason,
+    remainingHiders: game.remainingHiders,
+    totalHunters: game.totalHunters,
+    message: winner === "hunters" ? "Hunters Win!" : "Hiders Win!",
+    rematchAvailable: true,
+  });
+
+  // Match the friend's round-reset behavior: keep the room, reset player
+  // cosmetics/roles, and require everyone to ready up again for a rematch.
+  for (const playerId of rooms.get(roomId) ?? []) {
+    resetPlayerState(playerId, { keepRoom: true });
+  }
+  readyPlayers.get(roomId)?.clear();
+
+  // The game record remains available for debugging until the next round.
+  // The room itself returns to the lobby so players can play again.
+  roomState.set(roomId, "lobby");
+  return true;
+}
+
+================================================================================
+FILE: src\game\gameTimers.js
+================================================================================
+
+import { HIDE_DURATION_MS, HUNT_DURATION_MS } from "../config/constants.js";
+import { gameData, gameTimers, clearGameTimers } from "../state/store.js";
+import { endGame } from "./endGame.js";
+import { sendToRoom } from "../utils/sendMessage.js";
+
+export function startGameTimers(roomId) {
+  clearGameTimers(roomId);
+
+  const timers = { hideTimer: null, huntTimer: null };
+  gameTimers.set(roomId, timers);
+
+  timers.hideTimer = setTimeout(() => {
+    if (gameTimers.get(roomId) !== timers) return;
+
+    const game = gameData.get(roomId);
+    if (!game || game.status !== "playing") return;
+
+    timers.hideTimer = null;
+    game.phase = "hunting";
+
+    sendToRoom(roomId, "hunting-started", {
+      phase: "hunting",
+      message: "Hunting Started!",
+    });
+
+    timers.huntTimer = setTimeout(() => {
+      if (gameTimers.get(roomId) !== timers) return;
+
+      const activeGame = gameData.get(roomId);
+      if (activeGame?.status === "playing") {
+        endGame(roomId, "hiders", "time-expired");
+      }
+    }, HUNT_DURATION_MS);
+  }, HIDE_DURATION_MS);
+}
+
+================================================================================
+FILE: src\game\roleAssignment.js
+================================================================================
+
+export function hunterNum(size) {
+ if (size >= 2 && size <= 5) return 1;
+  if (size >= 6 && size <= 9) return 2;
+  return 0;
+}
+
+export function shufflePlayers(playerIds) {
+  const shuffled = [...playerIds];
+
+  for (let i = shuffled.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+
+  return shuffled;
+}
+
+export function assignRoles(playerIds) {
+  const shuffledPlayers = shufflePlayers(playerIds);
+  const totalHunters = hunterNum(playerIds.length);
+  const roles = new Map();
+
+  for (let i = 0; i < shuffledPlayers.length; i += 1) {
+    roles.set(shuffledPlayers[i], i < totalHunters ? "hunter" : "hider");
+  }
+
+  return {
+    roles,
+    totalHunters,
+    remainingHiders: playerIds.length - totalHunters,
+    caughtHiders: new Set(),
+    removedHiders: new Set(),
+    removedHunters: new Set(),
+    startedAt: Date.now(),
+    endedAt: null,
+    winner: null,
+    status: "playing",
+    phase: "hiding",
+  };
+}
+
+================================================================================
+FILE: src\handlers\gameHandlers.js
+================================================================================
+
+import {
+  socketToPlayer,
+  playerToRoom,
+  rooms,
+  roomHosts,
+  readyPlayers,
+  roomState,
+  gameData,
+  playerStates,
+} from "../state/store.js";
+import { assignRoles } from "../game/roleAssignment.js";
+import { startGameTimers } from "../game/gameTimers.js";
+import { endGame } from "../game/endGame.js";
+import { resetPlayerState } from "../state/store.js";
+import { sendError, sendMessage, sendToRoom } from "../utils/sendMessage.js";
+
+export function handleStartGame(socket) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!roomId || !playerId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers?.has(playerId)) {
+    return sendError(socket, "Room membership was not found", "ROOM_MEMBERSHIP_NOT_FOUND");
+  }
+  if (roomState.get(roomId) !== "lobby") {
+    return sendError(socket, "A game is already running", "GAME_IN_PROGRESS");
+  }
+  if (roomHosts.get(roomId) !== playerId) {
+    return sendError(socket, "Only the host can start the game", "HOST_ONLY");
+  }
+
+  const readyState = readyPlayers.get(roomId);
+  if (!readyState) return sendError(socket, "Room readiness state was not found", "READY_STATE_NOT_FOUND");
+
+  const roomMembersArr = [...roomMembers];
+  const allReady = roomMembersArr.length > 0 &&
+    roomMembersArr.every((memberId) => readyState.has(memberId));
+
+  if (!allReady) return sendError(socket, "All players must be ready", "PLAYERS_NOT_READY");
+  if (roomMembersArr.length < 2) {
+    return sendError(socket, "At least 2 players are required", "NOT_ENOUGH_PLAYERS");
+  }
+
+  const game = assignRoles(roomMembersArr);
+  gameData.set(roomId, game);
+  roomState.set(roomId, "playing");
+
+  for (const memberId of roomMembersArr) {
+    resetPlayerState(memberId, { keepRoom: true });
+    const playerState = playerStates.get(memberId);
+    if (playerState) playerState.role = game.roles.get(memberId);
+
+    sendMessage(
+      // The player's socket is looked up by the player ID, never supplied by the client.
+      (awaitSocketLookup(memberId)),
+      "game-started",
+      {
+        roomId,
+        hostId: playerId,
+        role: game.roles.get(memberId),
+        phase: game.phase,
+        startedAt: game.startedAt,
+      },
+    );
+  }
+
+  startGameTimers(roomId);
+}
+
+function awaitSocketLookup(playerId) {
+  // Kept as a tiny helper to make the identity lookup explicit.
+  // This is synchronous; the name is intentionally not async.
+  return importSocketMap().get(playerId);
+}
+
+function importSocketMap() {
+  return socketMap;
+}
+
+import { playerToSocket as socketMap } from "../state/store.js";
+
+function resolveTarget(roomMembers, data) {
+  const directId = data.targetId ?? data.targetPlayerId;
+  if (typeof directId === "string" && directId.trim() !== "") {
+    return { targetId: directId, ambiguous: false };
+  }
+
+  const targetName = data.targetUsername ?? data.targetUserName ?? data.targetName;
+  if (typeof targetName !== "string" || targetName.trim() === "") {
+    return { targetId: null, ambiguous: false };
+  }
+
+  const matches = [...roomMembers].filter(
+    (memberId) => playerStates.get(memberId)?.displayName === targetName,
+  );
+
+  if (matches.length > 1) return { targetId: null, ambiguous: true };
+  return { targetId: matches[0] ?? null, ambiguous: false };
+}
+
+export function handleCatchPlayer(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!playerId || !roomId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers?.has(playerId)) {
+    return sendError(socket, "You are not part of this room", "ROOM_MEMBERSHIP_NOT_FOUND");
+  }
+
+  const game = gameData.get(roomId);
+  if (!game || game.status !== "playing" || roomState.get(roomId) !== "playing") {
+    return sendError(socket, "The game is not running", "GAME_NOT_RUNNING");
+  }
+  if (game.phase !== "hunting") {
+    return sendError(socket, "The hunting phase has not started", "HUNTING_NOT_STARTED");
+  }
+
+  const { targetId, ambiguous } = resolveTarget(roomMembers, payload.data ?? {});
+  if (ambiguous) {
+    return sendError(socket, "That display name is not unique; use targetId instead", "AMBIGUOUS_TARGET");
+  }
+  if (!targetId || !roomMembers.has(targetId)) {
+    return sendError(socket, "Target player is not in this room", "TARGET_NOT_IN_ROOM");
+  }
+
+  if (game.roles.get(playerId) !== "hunter" || game.roles.get(targetId) !== "hider") {
+    return sendError(socket, "Only a hunter can catch a hider", "INVALID_CATCH");
+  }
+  if (game.caughtHiders.has(targetId) || game.removedHiders.has(targetId)) {
+    return sendError(socket, "That hider has already been caught or removed", "TARGET_ALREADY_CAUGHT");
+  }
+
+  game.caughtHiders.add(targetId);
+  game.remainingHiders = Math.max(0, game.remainingHiders - 1);
+  const targetState = playerStates.get(targetId);
+  if (targetState) targetState.caught = true;
+
+  sendToRoom(roomId, "player-caught", {
+    hunter: playerId,
+    hider: targetId,
+    remainingHiders: game.remainingHiders,
+  });
+
+  if (game.remainingHiders === 0) endGame(roomId, "hunters", "all-hiders-caught");
+}
+
+================================================================================
+FILE: src\handlers\playerHandlers.js
+================================================================================
+
+import {
+  socketToPlayer,
+  playerToRoom,
+  rooms,
+  roomHosts,
+  readyPlayers,
+  roomState,
+  gameData,
+  playerStates,
+  playerPositions,
+} from "../state/store.js";
+import { sendError, sendMessage, sendToRoom } from "../utils/sendMessage.js";
+
+export function handleUserSetup(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const state = playerStates.get(playerId);
+  if (!playerId || !state) return sendError(socket, "Player not found", "PLAYER_NOT_FOUND");
+
+  const requestedName = payload.data?.userName ?? payload.data?.displayName;
+  if (typeof requestedName !== "string" || requestedName.trim() === "" || requestedName.trim().length > 32) {
+    return sendError(socket, "userName must be between 1 and 32 characters", "INVALID_DISPLAY_NAME");
+  }
+
+  // A name is a display label only. The server-generated playerId remains the
+  // identity used for rooms, roles, catches, and authorization.
+  state.displayName = requestedName.trim();
+  sendMessage(socket, "user-setup-complete", {
+    playerId,
+    displayName: state.displayName,
+  });
+}
+
+export function handleChangedPose(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+  const pose = payload.data?.pose;
+
+  if (!playerId || !roomId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+  if (typeof pose !== "string" || pose.trim() === "" || pose.length > 40) {
+    return sendError(socket, "Pose must be a non-empty short string", "INVALID_POSE");
+  }
+
+  const state = playerStates.get(playerId);
+  if (state) state.pose = pose;
+  const position = playerPositions.get(playerId);
+  if (position) position.pose = pose;
+
+  sendToRoom(roomId, "pose-changed", {
+    playerId,
+    displayName: state?.displayName ?? null,
+    pose,
+  });
+}
+
+export function handleRequestState(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!playerId || !roomId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+  if (payload.data?.roomId && payload.data.roomId !== roomId) {
+    return sendError(socket, "You cannot request state for another room", "ROOM_ACCESS_DENIED");
+  }
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers?.has(playerId)) {
+    return sendError(socket, "Room membership was not found", "ROOM_MEMBERSHIP_NOT_FOUND");
+  }
+
+  const readyState = readyPlayers.get(roomId) ?? new Set();
+  const members = [...roomMembers].map((memberId) => ({
+    playerId: memberId,
+    displayName: playerStates.get(memberId)?.displayName ?? null,
+    ready: readyState.has(memberId),
+  }));
+
+  const players = [...roomMembers].map((memberId) => {
+    const state = playerStates.get(memberId);
+    const position = playerPositions.get(memberId) ?? state?.position ?? { x: 0, y: 0, z: 0 };
+
+    return {
+      playerId: memberId,
+      displayName: state?.displayName ?? null,
+      position: { ...position, x: position.x, y: position.y, z: position.z },
+      rotation: state?.rotation ?? position.rotation ?? 0,
+      color: state?.color ?? position.color ?? null,
+      pose: state?.pose ?? position.pose ?? "Stand",
+      caught: Boolean(state?.caught),
+    };
+  });
+
+  const game = gameData.get(roomId);
+  const isPlaying = game?.status === "playing";
+  sendMessage(socket, "room-snapshot", {
+    roomId,
+    hostId: roomHosts.get(roomId),
+    state: roomState.get(roomId),
+    phase: isPlaying ? game.phase : "lobby",
+    totalMembers: roomMembers.size,
+    members,
+    players,
+    yourRole: isPlaying ? game.roles.get(playerId) ?? null : null,
+    game: isPlaying ? {
+      startedAt: game.startedAt,
+      phase: game.phase,
+      totalHunters: game.totalHunters,
+      remainingHiders: game.remainingHiders,
+    } : null,
+  });
+}
+
+================================================================================
+FILE: src\handlers\playerRemoval.js
+================================================================================
+
+import {
+  playerToRoom,
+  rooms,
+  roomHosts,
+  readyPlayers,
+  roomState,
+  gameData,
+  playerStates,
+  playerPositions,
+  resetPlayerState,
+  clearRoomData,
+} from "../state/store.js";
+import { sendToRoom } from "../utils/sendMessage.js";
+import { endGame } from "../game/endGame.js";
+
+export function removePlayerFromRoom(playerId, eventType = "player-left") {
+  const roomId = playerToRoom.get(playerId);
+  if (!roomId) return null;
+
+  const roomMembers = rooms.get(roomId);
+  const playerState = playerStates.get(playerId);
+  if (!roomMembers || !roomMembers.has(playerId)) {
+    playerToRoom.delete(playerId);
+    resetPlayerState(playerId, { keepRoom: false });
+    return roomId;
+  }
+
+  const game = gameData.get(roomId);
+  const gameWasPlaying = roomState.get(roomId) === "playing" && game?.status === "playing";
+
+  if (gameWasPlaying) {
+    const role = game.roles.get(playerId);
+
+    if (role === "hider" &&
+        !game.caughtHiders.has(playerId) &&
+        !game.removedHiders.has(playerId)) {
+      game.removedHiders.add(playerId);
+      game.remainingHiders = Math.max(0, game.remainingHiders - 1);
+    }
+
+    if (role === "hunter" && !game.removedHunters.has(playerId)) {
+      game.removedHunters.add(playerId);
+      game.totalHunters = Math.max(0, game.totalHunters - 1);
+    }
+  }
+
+  roomMembers.delete(playerId);
+  playerToRoom.delete(playerId);
+  readyPlayers.get(roomId)?.delete(playerId);
+  playerPositions.delete(playerId);
+  resetPlayerState(playerId, { keepRoom: false });
+
+  sendToRoom(roomId, eventType, {
+    playerId,
+    displayName: playerState?.displayName ?? null,
+    remainingHiders: game?.remainingHiders ?? null,
+    totalHunters: game?.totalHunters ?? null,
+  });
+
+  if (gameWasPlaying && game?.status === "playing") {
+    if (game.totalHunters <= 0) {
+      endGame(roomId, "hiders", "all-hunters-left");
+    } else if (game.remainingHiders <= 0) {
+      endGame(roomId, "hunters", "all-hiders-left");
+    }
+  }
+
+  if (roomMembers.size === 0) {
+    clearRoomData(roomId);
+    return roomId;
+  }
+
+  if (roomHosts.get(roomId) === playerId) {
+    const newHostId = roomMembers.values().next().value;
+    roomHosts.set(roomId, newHostId);
+    sendToRoom(roomId, "host-changed", { hostId: newHostId });
+  }
+
+  return roomId;
+}
+
+================================================================================
+FILE: src\handlers\positionHandlers.js
+================================================================================
+
+import {
+  socketToPlayer,
+  playerToRoom,
+  rooms,
+  roomState,
+  playerPositions,
+  playerStates,
+} from "../state/store.js";
+import { sendError, sendMessage, sendToRoom } from "../utils/sendMessage.js";
+
+export function handleUpdatePosition(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+  if (!playerId || !roomId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers?.has(playerId)) return;
+  if (roomState.get(roomId) !== "playing") {
+    return sendError(socket, "Player movement is only accepted during a game", "GAME_NOT_RUNNING");
+  }
+
+  // Supports both the current format { data: { x, y, z } } and the friend's
+  // format { data: { coordinates: { x, y, z, ry, col } } }.
+  const data = payload.data ?? {};
+  const coordinates = data.coordinates ?? data.position ?? data;
+  const { x, y, z } = coordinates;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+    return sendError(socket, "Position x, y, and z must be finite numbers", "INVALID_POSITION");
+  }
+
+  const state = playerStates.get(playerId);
+  const rotationValue = coordinates.ry ?? coordinates.rotation ?? data.rotation;
+  if (rotationValue !== undefined && !Number.isFinite(rotationValue)) {
+    return sendError(socket, "Rotation must be a finite number", "INVALID_ROTATION");
+  }
+
+  const colorValue = coordinates.col ?? coordinates.color ?? data.color;
+  if (colorValue !== undefined && colorValue !== null &&
+      (typeof colorValue !== "string" || colorValue.length > 32)) {
+    return sendError(socket, "Color must be a short string or null", "INVALID_COLOR");
+  }
+
+  const poseValue = data.pose ?? coordinates.pose;
+  if (poseValue !== undefined &&
+      (typeof poseValue !== "string" || poseValue.trim() === "" || poseValue.length > 40)) {
+    return sendError(socket, "Pose must be a non-empty short string", "INVALID_POSE");
+  }
+
+  const position = { x, y, z };
+  if (state) {
+    state.position = position;
+    if (rotationValue !== undefined) state.rotation = rotationValue;
+    if (colorValue !== undefined) state.color = colorValue;
+    if (poseValue !== undefined) state.pose = poseValue;
+  }
+
+  const savedState = {
+    x,
+    y,
+    z,
+    rotation: state?.rotation ?? 0,
+    color: state?.color ?? null,
+    pose: state?.pose ?? "Stand",
+  };
+  playerPositions.set(playerId, savedState);
+
+  sendToRoom(roomId, "position-updated", {
+    playerId,
+    ...savedState,
+  }, playerId);
+}
+
+export function handleGetPositions(socket) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!playerId || !roomId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers?.has(playerId)) {
+    return sendError(socket, "Room membership was not found", "ROOM_MEMBERSHIP_NOT_FOUND");
+  }
+  if (roomState.get(roomId) !== "playing") {
+    return sendError(socket, "The game is not running", "GAME_NOT_RUNNING");
+  }
+
+  const positions = [];
+  for (const memberId of roomMembers) {
+    const position = playerPositions.get(memberId);
+    if (!position) continue;
+
+    positions.push({
+      playerId: memberId,
+      ...position,
+    });
+  }
+
+  sendMessage(socket, "room-positions", { roomId, positions });
+}
+
+================================================================================
+FILE: src\handlers\roomHandlers.js
+================================================================================
+
+import { randomUUID } from "node:crypto";
+import {
+  playerToRoom,
+  socketToPlayer,
+  rooms,
+  roomHosts,
+  readyPlayers,
+  roomState,
+  playerStates,
+  clearRoomData,
+} from "../state/store.js";
+import { sendError, sendMessage, sendToRoom } from "../utils/sendMessage.js";
+import { removePlayerFromRoom } from "../lifecycle/playerRemoval.js";
+
+export function handleCreateRoom(socket) {
+  const playerId = socketToPlayer.get(socket);
+  if (!playerId) return sendError(socket, "Player not found", "PLAYER_NOT_FOUND");
+
+  if (playerToRoom.has(playerId)) {
+    return sendError(socket, "You are already in a room", "ALREADY_IN_ROOM");
+  }
+
+  const roomId = randomUUID();
+  rooms.set(roomId, new Set([playerId]));
+  readyPlayers.set(roomId, new Set());
+  roomHosts.set(roomId, playerId);
+  playerToRoom.set(playerId, roomId);
+  roomState.set(roomId, "lobby");
+
+  const playerState = playerStates.get(playerId);
+  if (playerState) playerState.roomId = roomId;
+
+  sendMessage(socket, "room-created", { roomId, hostId: playerId });
+}
+
+export function handleJoinRoom(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = payload.data.roomId;
+
+  if (!playerId) return sendError(socket, "Player not found", "PLAYER_NOT_FOUND");
+  if (typeof roomId !== "string" || roomId.trim() === "") {
+    return sendError(socket, "Invalid room ID", "INVALID_ROOM_ID");
+  }
+  if (playerToRoom.has(playerId)) {
+    return sendError(socket, "You are already in a room", "ALREADY_IN_ROOM");
+  }
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers) return sendError(socket, "Room not found", "ROOM_NOT_FOUND");
+  if (roomState.get(roomId) !== "lobby") {
+    return sendError(socket, "Cannot join a room while a game is running", "GAME_IN_PROGRESS");
+  }
+
+  roomMembers.add(playerId);
+  playerToRoom.set(playerId, roomId);
+  const playerState = playerStates.get(playerId);
+  if (playerState) playerState.roomId = roomId;
+
+  sendToRoom(roomId, "player-joined", {
+    playerId,
+    displayName: playerState?.displayName ?? null,
+  }, playerId);
+  sendMessage(socket, "room-joined", { roomId, hostId: roomHosts.get(roomId) });
+}
+
+export function handleLeaveRoom(socket) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!playerId || !roomId) {
+    return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+  }
+
+  removePlayerFromRoom(playerId, "player-left");
+  sendMessage(socket, "room-left", { playerId, roomId });
+}
+
+export function handleSetReady(socket, payload) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!playerId || !roomId) return sendError(socket, "You are not in a room", "NOT_IN_ROOM");
+  if (typeof payload.data?.ready !== "boolean") {
+    return sendError(socket, "Ready must be true or false", "INVALID_READY_VALUE");
+  }
+
+  const readyState = readyPlayers.get(roomId);
+  const roomMembers = rooms.get(roomId);
+  if (!readyState || !roomMembers || !roomMembers.has(playerId)) {
+    return sendError(socket, "Room membership was not found", "ROOM_MEMBERSHIP_NOT_FOUND");
+  }
+  if (roomState.get(roomId) !== "lobby") {
+    return sendError(socket, "You cannot change readiness after the game starts", "GAME_IN_PROGRESS");
+  }
+
+  const ready = payload.data.ready;
+  if (ready) readyState.add(playerId);
+  else readyState.delete(playerId);
+
+  sendToRoom(roomId, "player-ready-changed", { playerId, ready });
+
+  const members = [...roomMembers];
+  const readyCount = members.filter((memberId) => readyState.has(memberId)).length;
+  const allReady = members.length > 0 && readyCount === members.length;
+
+  sendToRoom(roomId, "lobby-status", {
+    readyCount,
+    totalPlayers: members.length,
+    allReady,
+  });
+}
+
+export function handleRoomState(socket) {
+  const playerId = socketToPlayer.get(socket);
+  const roomId = playerToRoom.get(playerId);
+
+  if (!playerId || !roomId) {
+    return sendError(socket, "Player or room not found", "NOT_IN_ROOM");
+  }
+
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers?.has(playerId)) {
+    return sendError(socket, "Room membership was not found", "ROOM_MEMBERSHIP_NOT_FOUND");
+  }
+
+  const state = roomState.get(roomId);
+  if (state !== "lobby") {
+    return sendError(socket, "Room state is not in the lobby", "NOT_IN_LOBBY");
+  }
+
+  const hostId = roomHosts.get(roomId);
+  const readyState = readyPlayers.get(roomId) ?? new Set();
+  const members = [...roomMembers].map((memberId) => ({
+    playerId: memberId,
+    displayName: playerStates.get(memberId)?.displayName ?? null,
+    ready: readyState.has(memberId),
+  }));
+
+  sendMessage(socket, "room-state", {
+    roomId,
+    hostId,
+    totalMembers: roomMembers.size,
+    state,
+    members,
+  });
+}
+
+================================================================================
+FILE: src\router\messageRouter.js
+================================================================================
+
+
+
+================================================================================
+FILE: src\state\stores.js
+================================================================================
+
+export const playerToSocket = new Map();
+export const socketToPlayer = new Map();
+
+export const rooms = new Map();
+export const playerToRoom = new Map();
+export const roomHosts = new Map();
+export const readyPlayers = new Map();
+export const roomState = new Map();
+
+export const gameData = new Map();
+export const gameTimers = new Map();
+export const playerPositions = new Map();
+export const playerStates = new Map();
+
+export function createPlayerState(playerId) {
+  return {
+    playerId,
+    displayName: null,
+    roomId: null,
+    role: null,
+    pose: "Stand",
+    position: { x: 0, y: 0, z: 0 },
+    rotation: 0,
+    color: null,
+    caught: false,
+    connected: true,
+  };
+}
+
+export function resetPlayerState(playerId, { keepRoom = true } = {}) {
+  const state = playerStates.get(playerId);
+  if (!state) return;
+
+  if (!keepRoom) state.roomId = null;
+  state.role = null;
+  state.pose = "Stand";
+  state.position = { x: 0, y: 0, z: 0 };
+  state.rotation = 0;
+  state.color = null;
+  state.caught = false;
+
+  playerPositions.delete(playerId);
+}
+
+export function clearGameTimers(roomId) {
+  const timers = gameTimers.get(roomId);
+  if (!timers) return;
+
+  if (typeof timers === "object") {
+    if (timers.hideTimer) clearTimeout(timers.hideTimer);
+    if (timers.huntTimer) clearTimeout(timers.huntTimer);
+  } else {
+    // Backward-compatible cleanup if a room still has a single timer handle.
+    clearTimeout(timers);
+  }
+
+  gameTimers.delete(roomId);
+}
+
+export function clearRoomData(roomId) {
+  clearGameTimers(roomId);
+  rooms.delete(roomId);
+  roomHosts.delete(roomId);
+  readyPlayers.delete(roomId);
+  roomState.delete(roomId);
+  gameData.delete(roomId);
+}
+
+================================================================================
+FILE: src\utils\sendMessage.js
+================================================================================
+
+export function sendMessage(socket, type, data = {}) {
+  if (!socket || socket.readyState !== 1) return false;
+
+  socket.send(JSON.stringify({ type, data }));
+  return true;
+}
+
+export function sendError(socket, message, code = "BAD_REQUEST") {
+  return sendMessage(socket, "error", { code, message });
+}
+
+export function sendToRoom(roomId, type, data = {}, excludedPlayerId = null) {
+  const roomMembers = rooms.get(roomId);
+  if (!roomMembers) return 0;
+
+  let sent = 0;
+  for (const memberId of roomMembers) {
+    if (memberId === excludedPlayerId) continue;
+    const memberSocket = playerToSocket.get(memberId);
+    if (sendMessage(memberSocket, type, data)) sent += 1;
+  }
+  return sent;
+}
+
+ 
+
+================================================================================
+FILE: src\websocket\connection.js
+================================================================================
+
+import { randomUUID } from "node:crypto";
+import {
+  playerToSocket,
+  socketToPlayer,
+  playerToRoom,
+  playerStates,
+  playerPositions,
+  createPlayerState,
+} from "../state/store.js";
+import { sendMessage } from "../utils/sendMessage.js";
+import { handleIncomingMessage } from "./messageRouter.js";
+import { removePlayerFromRoom } from "../lifecycle/playerRemoval.js";
+
+export function handleConnection(socket) {
+  const playerId = randomUUID();
+
+  playerToSocket.set(playerId, socket);
+  socketToPlayer.set(socket, playerId);
+  playerStates.set(playerId, createPlayerState(playerId));
+
+  console.log("Player connected:", playerId);
+  sendMessage(socket, "connected", { playerId });
+
+  socket.on("message", (message) => {
+    handleIncomingMessage(socket, message);
+  });
+
+  socket.on("close", () => handleDisconnect(socket));
+  socket.on("error", (error) => {
+    console.error("WebSocket error:", error.message);
+  });
+}
+
+function handleDisconnect(socket) {
+  const playerId = socketToPlayer.get(socket);
+  if (!playerId) return;
+
+  console.log("Player disconnected:", playerId);
+
+  if (playerToRoom.has(playerId)) {
+    removePlayerFromRoom(playerId, "player-disconnected");
+  }
+
+  playerToRoom.delete(playerId);
+  playerPositions.delete(playerId);
+  playerStates.delete(playerId);
+  playerToSocket.delete(playerId);
+  socketToPlayer.delete(socket);
+}
+
+
+================================================================================
+FILE: src\websocket\messageRouter.js
+================================================================================
+
+import { sendError, sendMessage } from "../utils/sendMessage.js";
+import {
+  handleCreateRoom,
+  handleJoinRoom,
+  handleLeaveRoom,
+  handleSetReady,
+  handleRoomState,
+} from "../handlers/roomHandlers.js";
+import { handleStartGame, handleCatchPlayer } from "../handlers/gameHandlers.js";
+import { handleUpdatePosition, handleGetPositions } from "../handlers/positionHandlers.js";
+import {
+  handleChangedPose,
+  handleRequestState,
+  handleUserSetup,
+} from "../handlers/playerHandlers.js";
+
+export function handleIncomingMessage(socket, message) {
+  let payload;
+
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    sendError(socket, "Invalid JSON", "INVALID_JSON");
+    return;
+  }
+
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload) ||
+    typeof payload.type !== "string" ||
+    typeof payload.data !== "object" ||
+    payload.data === null ||
+    Array.isArray(payload.data)
+  ) {
+    sendError(socket, "Invalid message format", "INVALID_MESSAGE_FORMAT");
+    return;
+  }
+
+  switch (payload.type) {
+    case "echo": {
+      if (typeof payload.data.message !== "string") {
+        sendError(socket, "Echo message must be a string", "INVALID_ECHO");
+        return;
+      }
+      sendMessage(socket, "echo-response", { message: payload.data.message });
+      return;
+    }
+    case "user-setup":
+      handleUserSetup(socket, payload);
+      return;
+    case "create-room":
+      handleCreateRoom(socket);
+      return;
+    case "join-room":
+      handleJoinRoom(socket, payload);
+      return;
+    case "leave-room":
+      handleLeaveRoom(socket);
+      return;
+    case "set-ready":
+      handleSetReady(socket, payload);
+      return;
+    case "start-game":
+      handleStartGame(socket);
+      return;
+    case "catch-player":
+    case "mark-caught":
+      handleCatchPlayer(socket, payload);
+      return;
+    case "update-position":
+    case "movement":
+      handleUpdatePosition(socket, payload);
+      return;
+    case "get-positions":
+    case "get-positons":
+      handleGetPositions(socket);
+      return;
+    case "room-state":
+      handleRoomState(socket);
+      return;
+    case "changed-pose":
+      handleChangedPose(socket, payload);
+      return;
+    case "request-state":
+      handleRequestState(socket, payload);
+      return;
+    default:
+      sendError(socket, `Unknown message type: ${payload.type}`, "UNKNOWN_MESSAGE_TYPE");
+  }
+}
